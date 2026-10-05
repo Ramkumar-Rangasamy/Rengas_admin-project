@@ -1,0 +1,330 @@
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  Injectable,
+  Post,
+  Req,
+  UnauthorizedException,
+  UseGuards,
+} from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import {
+  IsArray,
+  IsInt,
+  IsNumber,
+  IsOptional,
+  IsString,
+  ArrayMinSize,
+  ArrayMaxSize,
+  MaxLength,
+  Min,
+  ValidateNested,
+} from "class-validator";
+import { Type } from "class-transformer";
+import { randomUUID } from "node:crypto";
+import { Repository } from "typeorm";
+import {
+  Category,
+  Customer,
+  Order,
+  OrderItem,
+  OrderStatus,
+  Product,
+  Notification,
+  NotificationType,
+  Role,
+} from "../entities";
+import {
+  CustomerAuthGuard,
+  CustomerRequest,
+} from "../auth/customer-auth.guard";
+
+class StoreOrderItemDto {
+  @Type(() => Number) @IsInt() @Min(1) productId: number;
+  @Type(() => Number) @IsNumber() @Min(0.01) quantity: number;
+}
+class LegacyStoreCustomerDto {
+  @IsOptional() @IsString() @MaxLength(150) name?: string;
+  @IsOptional() @IsString() @MaxLength(180) companyName?: string;
+  @IsOptional() @IsString() @MaxLength(100) tinNumber?: string;
+  @IsOptional() @IsString() @MaxLength(40) phoneNumber?: string;
+  @IsOptional() @IsString() @MaxLength(40) whatsappNumber?: string;
+  @IsOptional() @IsString() @MaxLength(500) address?: string;
+}
+class CreateStoreOrderDto {
+  // Accepted for compatibility with existing storefront clients, but ignored;
+  // customer identity always comes from the verified JWT.
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => LegacyStoreCustomerDto)
+  customer?: LegacyStoreCustomerDto;
+
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(500)
+  @ValidateNested({ each: true })
+  @Type(() => StoreOrderItemDto)
+  items: StoreOrderItemDto[];
+}
+
+@Injectable()
+export class StoreService {
+  constructor(
+    @InjectRepository(Product) private products: Repository<Product>,
+    @InjectRepository(Category) private categories: Repository<Category>,
+    @InjectRepository(Customer) private customers: Repository<Customer>,
+    @InjectRepository(Order) private orders: Repository<Order>,
+    @InjectRepository(OrderItem) private orderItems: Repository<OrderItem>,
+  ) {}
+
+  async listCategories() {
+    const categories = await this.categories.find({
+      select: { id: true, name: true },
+      order: { name: "ASC", id: "ASC" },
+      loadEagerRelations: false,
+    });
+
+    return categories.map(({ id, name }) => ({ id, name }));
+  }
+
+  async listProducts() {
+    const rows = await this.products.find({
+      order: { description: "ASC", id: "ASC" },
+    });
+    // A database product is an orderable SKU. Never collapse pack sizes or
+    // duplicate descriptions: cards, detail URLs and checkout all use its ID.
+    return rows.map((row) => ({
+      id: row.id,
+      code: row.code,
+      name: row.description,
+      subtitle: "",
+      category: row.category,
+      imageUrl: row.imageUrl,
+      uoms: [
+        {
+          id: row.id,
+          productId: row.id,
+          name: row.uom,
+          price: Number(row.price),
+          pack: `${row.uom} • ${row.code}`,
+        },
+      ],
+    }));
+  }
+
+  async createOrder(customerId: number, input: CreateStoreOrderDto) {
+    if (!input.items?.length) {
+      throw new BadRequestException("Add at least one item");
+    }
+
+    /*
+     * Validate products before creating the customer
+     * or order.
+     */
+    const ids = input.items.map((item) => item.productId);
+
+    const products = await this.products.findByIds(ids);
+
+    if (products.length !== new Set(ids).size) {
+      throw new BadRequestException("One or more products no longer exist");
+    }
+
+    const customer = await this.customers.findOneBy({ id: customerId });
+    if (!customer) {
+      throw new UnauthorizedException("The customer account no longer exists.");
+    }
+
+    /*
+     * First save the order without items.
+     * This creates the order ID.
+     */
+    return this.orders.manager.transaction(async (manager) => {
+      const orderRepo = manager.getRepository(Order);
+      const itemRepo = manager.getRepository(OrderItem);
+      let order = await orderRepo.save(
+        orderRepo.create({
+          orderNo: `TEMP-${randomUUID()}`,
+          orderDate: new Date().toISOString().slice(0, 10),
+          status: OrderStatus.ACCEPTED,
+          customer,
+          items: [],
+        }),
+      );
+
+      order.orderNo = `RB-${String(order.id).padStart(3, "0")}`;
+      order = await orderRepo.save(order);
+
+      /*
+       * The order now has an ID.
+       * Save order items separately with that order.
+       */
+      const lines = input.items.map((item) => {
+        const product = products.find(
+          (currentProduct) => currentProduct.id === item.productId,
+        );
+
+        if (!product) {
+          throw new BadRequestException(
+            `Product ${item.productId} no longer exists`,
+          );
+        }
+
+        return itemRepo.create({
+          order,
+          product,
+          quantity: item.quantity,
+          unitPrice: Number(product.price),
+        });
+      });
+
+      await itemRepo.save(lines);
+      await manager.getRepository(Notification).save({
+        title: "New order " + order.orderNo,
+        message:
+          (customer.companyName || "Customer shop").slice(0, 180) +
+          " placed " +
+          order.orderNo,
+        type: NotificationType.INFO,
+        recipientRole: Role.ORDER_ADMIN,
+        isRead: false,
+      });
+
+      /*
+       * Return the completed order with customer
+       * and items.
+       */
+      return orderRepo.findOneOrFail({
+        where: {
+          id: order.id,
+        },
+        relations: {
+          customer: true,
+          items: {
+            product: true,
+          },
+        },
+      });
+    });
+  }
+
+  async recentOrders(customerId: number) {
+    // QueryBuilder avoids eager customer, item, product and category relations.
+    const orders = await this.orders
+      .createQueryBuilder("order")
+      .select(["order.id", "order.orderNo", "order.orderDate", "order.status"])
+      .where("order.customer_id = :customerId", { customerId })
+      .orderBy("order.orderDate", "DESC")
+      .addOrderBy("order.id", "DESC")
+      .take(10)
+      .getMany();
+    return orders.map((order) => ({
+      id: order.id,
+      orderNo: order.orderNo,
+      date: order.orderDate,
+      status: order.status,
+    }));
+  }
+
+  async getOrders(customerId: number) {
+    const orders = await this.orders.find({
+      where: { customer: { id: customerId } },
+      loadEagerRelations: false,
+      relations: {
+        customer: true,
+        items: {
+          product: true,
+        },
+      },
+      order: {
+        orderDate: "DESC",
+        id: "DESC",
+      },
+    });
+
+    return orders.map((order) => {
+      const total = order.items.reduce(
+        (sum, item) => sum + Number(item.quantity) * Number(item.unitPrice),
+        0,
+      );
+
+      const itemCount = order.items.reduce(
+        (sum, item) => sum + Number(item.quantity),
+        0,
+      );
+
+      return {
+        id: order.id,
+        orderNo: order.orderNo,
+        date: order.orderDate,
+        status: order.status,
+        itemCount,
+        total,
+        customer: {
+          id: order.customer?.id,
+          name: order.customer?.name || "",
+          companyName: order.customer?.companyName || "",
+          tinNumber: order.customer?.tinNumber || "",
+          phoneNumber: order.customer?.phoneNumber || "",
+          whatsappNumber: order.customer?.whatsappNumber || "",
+          address: order.customer?.address || "",
+        },
+        items: order.items.map((item) => ({
+          id: item.id,
+          uom: item.product.uom,
+          uomId: item.product.id,
+          quantity: Number(item.quantity),
+          unitPrice: Number(item.unitPrice),
+          amount: Number(item.quantity) * Number(item.unitPrice),
+          product: {
+            id: item.product.id,
+            code: item.product.code,
+            name: item.product.description,
+            imageUrl: item.product.imageUrl,
+          },
+        })),
+      };
+    });
+  }
+}
+
+@Controller("store")
+export class StoreController {
+  constructor(private readonly store: StoreService) {}
+
+  @Get("products")
+  products() {
+    return this.store.listProducts();
+  }
+  @Get("categories")
+  categories() {
+    return this.store.listCategories();
+  }
+
+  @Get("orders/recent")
+  @UseGuards(CustomerAuthGuard)
+  recentOrders(@Req() request: CustomerRequest) {
+    return this.store.recentOrders(request.user!.customerId);
+  }
+
+  @Get("orders")
+  @UseGuards(CustomerAuthGuard)
+  getOrders(@Req() request: CustomerRequest) {
+    return this.store.getOrders(request.user!.customerId);
+  }
+
+  @Post("orders")
+  @UseGuards(CustomerAuthGuard)
+  async createOrder(
+    @Req() request: CustomerRequest,
+    @Body() input: CreateStoreOrderDto,
+  ) {
+    try {
+      return await this.store.createOrder(request.user!.customerId, input);
+    } catch (error) {
+      console.error("CREATE ORDER FAILED:", error);
+      throw error;
+    }
+  }
+}
